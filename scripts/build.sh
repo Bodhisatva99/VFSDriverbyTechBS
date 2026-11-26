@@ -86,7 +86,7 @@ gcc "${CFLAGS[@]}" -fPIC -fvisibility=hidden -shared "${SHARED_HARDENING[@]}" \
     -DVFS491_DEFAULT_HELPER='"/usr/libexec/vfs491/vfs_proprietary-capture-helper"' \
     -DVFS491_DEFAULT_HP_LIBDIR='"/usr/lib/vfs491/vendor"' \
     -DVFS491_DEFAULT_FIRMWARE='"/usr/lib/vfs491/vendor/firmware/HPUsbVFS491.img"' \
-    "$ROOT/src/vfs491-tod.c" "${TOD_LIBS[@]}" \
+    "$ROOT/src/vfs491-tod.c" "$ROOT/src/vfs491-image-metrics.c" "${TOD_LIBS[@]}" \
     -o "$BUILD/tod/libfprint-tod-vfs491.so"
 
 printf '\nValidating target-linked TOD module...\n'

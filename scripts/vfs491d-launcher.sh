@@ -14,9 +14,11 @@ SOCKET=/var/lib/vfs491/control.sock
 READY_MARKER=/tmp/vcsSemKey_ServiceReady
 SERVICE_ID=/tmp/vcsSemKey_ServiceId
 SERVICE_PID=""
+SERVICE_STARTTIME=""
 PIDOF_STAGED=""
 FRAME_FILE=""
 LAUNCHER_PID=""
+BROKER_PID=""
 NAMESPACE_ISOLATED=0
 PRIVATE_MOUNTS_ACTIVE=0
 SERVICE_LAUNCHED=0
@@ -33,9 +35,11 @@ same_namespace() {
 }
 
 find_vendor_pids() {
-    local proc exe base comm proc_mnt self_mnt proc_ipc self_ipc
+    local proc state exe base comm proc_mnt self_mnt proc_ipc self_ipc
     for proc in /proc/[0-9]*; do
         [[ -d "$proc" ]] || continue
+        state="$(awk '{print $3}' "$proc/stat" 2>/dev/null || true)"
+        [[ "$state" != Z && "$state" != X && -n "$state" ]] || continue
         exe="$(readlink -f "$proc/exe" 2>/dev/null || true)"
         base="${exe##*/}"
         proc_mnt="$(readlink "$proc/ns/mnt" 2>/dev/null || true)"
@@ -85,10 +89,23 @@ wait_sensor_stable() {
     return 1
 }
 
+proc_identity() {
+    local pid="$1" stat_text
+    stat_text="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    awk '{ sub(/^.*\) /, ""); print $1, $20 }' <<< "$stat_text"
+}
+
 stop_vendor_service() {
-    local pid="${SERVICE_PID:-}" exe="" comm=""
-    [[ -n "$pid" ]] || return 0
+    local pid="${SERVICE_PID:-}" identity state starttime exe="" comm=""
+    [[ -n "$pid" && -n "$SERVICE_STARTTIME" ]] || return 0
     kill -0 "$pid" 2>/dev/null || return 0
+    identity="$(proc_identity "$pid" 2>/dev/null || true)"
+    read -r state starttime <<< "$identity"
+    if [[ "$starttime" != "$SERVICE_STARTTIME" ]]; then
+        log "service PID $pid identity changed; refusing to signal a reused PID"
+        return 0
+    fi
+    [[ "$state" != Z && "$state" != X ]] || return 0
     exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
     comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
     if [[ "${exe##*/}" != vcsFPService && "$comm" != vcsFPService ]]; then
@@ -97,18 +114,20 @@ stop_vendor_service() {
     fi
     kill -TERM "$pid" 2>/dev/null || true
     for _ in $(seq 1 40); do
-        kill -0 "$pid" 2>/dev/null || return 0
-        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
-        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
-        if [[ "${exe##*/}" != vcsFPService && "$comm" != vcsFPService ]]; then
-            return 0
-        fi
+        identity="$(proc_identity "$pid" 2>/dev/null || true)"
+        read -r state starttime <<< "$identity"
+        [[ "$starttime" == "$SERVICE_STARTTIME" ]] || return 0
+        [[ "$state" != Z && "$state" != X ]] || return 0
         sleep 0.1
     done
-    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
-    comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
-    if [[ "${exe##*/}" == vcsFPService || "$comm" == vcsFPService ]]; then
-        kill -KILL "$pid" 2>/dev/null || true
+    identity="$(proc_identity "$pid" 2>/dev/null || true)"
+    read -r state starttime <<< "$identity"
+    if [[ "$starttime" == "$SERVICE_STARTTIME" && "$state" != Z && "$state" != X ]]; then
+        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        if [[ "${exe##*/}" == vcsFPService || "$comm" == vcsFPService ]]; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -121,14 +140,29 @@ cleanup() {
     # Never touch host service processes or host marker paths if isolation
     # validation failed or private mounts were not established.
     if (( NAMESPACE_ISOLATED == 1 )); then
+        # On an intentional service stop, shut down broker/bridge/helper first.
+        # This keeps the vendor IPC owner alive until its capture children exit.
+        if [[ -n "$BROKER_PID" ]]; then
+            if pid_is_running "$BROKER_PID"; then
+                kill -TERM "$BROKER_PID" 2>/dev/null || true
+                for _ in $(seq 1 50); do
+                    pid_is_running "$BROKER_PID" || break
+                    sleep 0.1
+                done
+                pid_is_running "$BROKER_PID" && kill -KILL "$BROKER_PID" 2>/dev/null || true
+            fi
+            wait "$BROKER_PID" 2>/dev/null || true
+            BROKER_PID=""
+        fi
         if (( SERVICE_LAUNCHED == 1 )); then
-            # The daemon can be long-lived; stop only processes still identified
-            # as the vendor executable inside this private service namespace.
-            while IFS= read -r pid; do
-                [[ -n "$pid" ]] || continue
-                SERVICE_PID="$pid"
-                stop_vendor_service
-            done < <(find_vendor_pids || true)
+            # Stop only the exact vendor process captured at startup.
+            stop_vendor_service
+            # The service is launched as a direct child (the subshell execs it).
+            # Reap it so controlled resets do not leave zombies.
+            if [[ -n "$LAUNCHER_PID" ]]; then
+                wait "$LAUNCHER_PID" 2>/dev/null || true
+                LAUNCHER_PID=""
+            fi
         fi
         [[ -z "$PIDOF_STAGED" ]] || rm -f "$PIDOF_STAGED" || true
         if (( PRIVATE_MOUNTS_ACTIVE == 1 )); then
@@ -160,7 +194,7 @@ done
 [[ -x "$VENDOR_DIR/vcsFPService" && -x "$BRIDGE" && -x "$HELPER" && -x "$DAEMON" ]] || fail "runtime executable mode is invalid"
 [[ -d /run/lock ]] || fail "/run/lock is unavailable before private /run setup"
 
-# Hold the host-visible device lock for the entire boot-resident daemon lifetime.
+# Hold the host-visible device lock for the entire systemd service lifetime.
 exec 9>/run/lock/vfs491-capture.lock
 flock -n 9 || fail "another VFS491 session is active" 21
 
@@ -192,7 +226,7 @@ SERVICE_LAUNCHED=1
     cd /
     export LD_LIBRARY_PATH="$VENDOR_DIR"
     exec "$VENDOR_DIR/vcsFPService"
-) >/dev/null 2>&1 &
+) &
 LAUNCHER_PID=$!
 
 service_ready=0
@@ -206,13 +240,59 @@ for _ in $(seq 1 120); do
     sleep 0.25
 done
 (( service_ready == 1 )) || fail "vcsFPService did not publish readiness within 30 seconds (launcher PID $LAUNCHER_PID)"
+SERVICE_STARTTIME="$(proc_identity "$SERVICE_PID" | awk '{print $2}')"
+[[ "$SERVICE_STARTTIME" =~ ^[0-9]+$ ]] || fail "could not record vcsFPService process start time"
 wait_sensor_stable 8 || fail "VFS491 USB did not stabilize after HP service startup" 22
 
 export VFS491_HP_LIBDIR="$VENDOR_DIR"
 export VFS491_READFULL_SHIM="$READFULL"
 export VFS491_READY_MARKER="$READY_MARKER"
+export VFS491_VENDOR_PID="$SERVICE_PID"
+export VFS491_VENDOR_STARTTIME="$SERVICE_STARTTIME"
 export VFS491_SERVICE_START_WAIT_MS=1000
 export VFS491_BRIDGE_TIMEOUT_MS=90000
 
-log "HP service ready (PID $SERVICE_PID); handing control to the persistent socket broker"
-python3 "$DAEMON" --socket "$SOCKET"
+pid_is_running() {
+    local pid="$1" state
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ -n "$state" && "$state" != Z && "$state" != X ]]
+}
+
+vendor_pid_is_healthy() {
+    local pid="$SERVICE_PID" identity state starttime exe comm
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    identity="$(proc_identity "$pid" 2>/dev/null || true)"
+    read -r state starttime <<< "$identity"
+    [[ -n "$state" && "$state" != Z && "$state" != X ]] || return 1
+    [[ "$starttime" == "$SERVICE_STARTTIME" ]] || return 1
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+    [[ "${exe##*/}" == vcsFPService || "$comm" == vcsFPService ]]
+}
+
+log "HP service ready (PID $SERVICE_PID); starting supervised socket broker"
+python3 "$DAEMON" --socket "$SOCKET" &
+BROKER_PID=$!
+
+while true; do
+    if [[ -n "$BROKER_PID" ]] && ! pid_is_running "$BROKER_PID"; then
+        set +e
+        wait "$BROKER_PID"
+        broker_status=$?
+        set -e
+        BROKER_PID=""
+        log "capture broker exited unexpectedly with status $broker_status; vendor service is left untouched and VFS491 remains unavailable until sudo vfs491-recover"
+    fi
+
+    if ! vendor_pid_is_healthy; then
+        if [[ "${VENDOR_LOST_LOGGED:-0}" != 1 ]]; then
+            log "vendor service health lost (expected vcsFPService PID $SERVICE_PID); broker remains alive and will reject new captures; use vfs491-recover after fprintd is stopped"
+            VENDOR_LOST_LOGGED=1
+        fi
+    else
+        VENDOR_LOST_LOGGED=0
+    fi
+
+    sleep 1
+done

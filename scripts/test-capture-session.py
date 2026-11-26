@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the boot-resident broker across repeated captures and client claims."""
+"""Exercise the broker across repeated captures and client claims."""
 
 import argparse
 import os

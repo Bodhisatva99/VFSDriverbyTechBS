@@ -25,13 +25,32 @@ assert len(raw) == 20 + image_len, len(raw)
 print(f"PASS: VFS491 bridge frame {width}x{height}, {image_len} grayscale bytes")
 PY
 
-# A vendor helper timeout while waiting for a swipe is retryable, not fatal.
+# A vendor helper no-swipe timeout taints the session; the broker resets it after claim close.
 set +e
 VFS491_TEST_SKIP_SERVICE_CHECK=1 "$BRIDGE" "$ROOT/tests/fake-timeout-helper.py" >"$OUT" 2>"$LOG"
 status=$?
 set -e
 [[ "$status" -eq 10 ]] || { echo "Expected retry status 10, got $status" >&2; cat "$LOG" >&2; exit 1; }
-echo "PASS: no-swipe vendor timeout maps to retry status 10"
+echo "PASS: no-swipe vendor timeout maps to session-reset status 10"
+
+# An outer helper deadline also taints the session and requires recovery.
+set +e
+VFS491_BRIDGE_TIMEOUT_MS=1000 VFS491_TEST_SKIP_SERVICE_CHECK=1 \
+  "$BRIDGE" "$ROOT/tests/fake-hanging-helper.py" >"$OUT" 2>"$LOG"
+status=$?
+set -e
+[[ "$status" -eq 10 ]] || { echo "Expected outer no-swipe deadline status 10, got $status" >&2; cat "$LOG" >&2; exit 1; }
+echo "PASS: outer vendor capture deadline maps to session-reset status 10"
+
+# The known helper exits 1 for VFSW_CAPTURE_ERROR, but logs this message and
+# reaches its normal cleanup path. That is safe for a bounded in-claim retry.
+set +e
+VFS491_TEST_SKIP_SERVICE_CHECK=1 "$BRIDGE" "$ROOT/tests/fake-capture-error-helper.py" >"$OUT" 2>"$LOG"
+status=$?
+set -e
+[[ "$status" -eq 11 ]] || { echo "Expected acquisition status 11, got $status" >&2; cat "$LOG" >&2; exit 1; }
+grep -q 'bounded retry is safe' "$LOG"
+echo "PASS: normal VFSW_CAPTURE_ERROR cleanup maps to bounded-retry status 11"
 
 # A successful helper exit must not make malformed ready metadata acceptable.
 set +e

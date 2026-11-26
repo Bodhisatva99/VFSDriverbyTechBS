@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Bridge a fprintd TOD stdio protocol to the boot-resident VFS491 broker."""
+"""Bridge a fprintd TOD stdio protocol to the systemd-managed VFS491 broker."""
 
 from __future__ import annotations
 

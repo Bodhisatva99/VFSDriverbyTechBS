@@ -29,6 +29,9 @@ FRAME_VERSION = 1
 IMAGE_WIDTH = 200
 
 STOP = False
+DEGRADED = False
+SESSION_RESET_STATUS = 14
+RESET_DRAIN_TIMEOUT = float(os.environ.get("VFS491_RESET_DRAIN_TIMEOUT", "45"))
 
 
 def log(message: str) -> None:
@@ -84,6 +87,92 @@ def validate_frame(frame: bytes) -> bool:
         and image_len == width * height
         and len(frame) == FRAME_HEADER.size + image_len
     )
+
+
+def vendor_service_health() -> tuple[bool, str]:
+    """Check the exact vendor PID supplied by the isolated service launcher."""
+    if os.environ.get("VFS491D_TEST_MODE") == "1":
+        health_file = os.environ.get("VFS491_TEST_VENDOR_HEALTH_FILE")
+        if health_file:
+            try:
+                state = Path(health_file).read_text().strip()
+            except OSError as exc:
+                return False, f"test vendor health file unavailable: {exc}"
+            return (state == "ok", f"test vendor health={state}")
+        return True, "test mode"
+
+    raw_pid = os.environ.get("VFS491_VENDOR_PID", "")
+    if not raw_pid.isdigit() or int(raw_pid) <= 1:
+        return False, "vendor PID was not supplied by the service launcher"
+
+    pid = int(raw_pid)
+    proc = Path(f"/proc/{pid}")
+    try:
+        stat_text = (proc / "stat").read_text()
+        close_paren = stat_text.rfind(")")
+        if close_paren < 0:
+            return False, f"vendor PID {pid} has malformed /proc stat data"
+        stat_fields = stat_text[close_paren + 1:].split()
+        state = stat_fields[0]
+        starttime = stat_fields[19]
+        comm = (proc / "comm").read_text().strip()
+        exe = os.readlink(proc / "exe")
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, IndexError) as exc:
+        return False, f"vendor PID {pid} is unavailable: {exc}"
+
+    expected_starttime = os.environ.get("VFS491_VENDOR_STARTTIME", "")
+    if not expected_starttime.isdigit() or starttime != expected_starttime:
+        return False, f"vendor PID {pid} identity changed (starttime {starttime}, expected {expected_starttime or 'unset'})"
+    if state in {"Z", "X"}:
+        return False, f"vendor PID {pid} is not running (state {state})"
+    if comm != "vcsFPService" and Path(exe).name != "vcsFPService":
+        return False, f"PID {pid} no longer identifies vcsFPService ({comm}, {exe})"
+    if not os.path.exists(READY_MARKER):
+        return False, "vendor readiness marker is missing"
+    return True, f"vcsFPService PID {pid} is present and ready"
+
+
+def drain_poisoned_client(conn: socket.socket, buffered: bytearray) -> None:
+    """Bound protocol cleanup; socket close is not authority to reset USB state."""
+    conn.settimeout(RESET_DRAIN_TIMEOUT)
+    deadline = time.monotonic() + RESET_DRAIN_TIMEOUT
+    try:
+        while not STOP:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log("client proxy did not close before diagnostic drain deadline; vendor remains degraded")
+                return
+            conn.settimeout(remaining)
+            command, buffered = read_command(conn, buffered)
+            if command is None or command == b"QUIT":
+                log("client proxy closed; vendor session remains degraded; no automatic USB reset")
+                return
+            try:
+                conn.sendall(f"ERR {SESSION_RESET_STATUS}\n".encode())
+            except OSError:
+                return
+    except (OSError, ValueError, socket.timeout) as exc:
+        log(f"client drain ended: {exc}; vendor remains degraded")
+    finally:
+        conn.settimeout(None)
+
+
+def poison_session(conn: socket.socket, reason: str, buffered: bytearray) -> None:
+    """Fail closed; do not reset vendor USB state from inside a fprintd claim.
+
+    The TOD close callback may run before fprintd's D-Bus Release method has
+    returned. A socket QUIT/EOF is not proof that the D-Bus claim is gone.
+    Recovery is an explicit administrative operation that stops fprintd first.
+    """
+    global DEGRADED
+    DEGRADED = True
+    log(f"vendor session marked degraded: {reason}; automatic reset disabled")
+    try:
+        conn.sendall(f"ERR {SESSION_RESET_STATUS}\n".encode())
+    except OSError:
+        log("client disconnected before degraded-session status could be delivered")
+        return
+    drain_poisoned_client(conn, buffered)
 
 
 def capture_one(conn: socket.socket, initial_buffer: bytearray) -> tuple[int, bytearray, bool]:
@@ -189,9 +278,20 @@ def peer_is_root(conn: socket.socket) -> bool:
 
 
 def serve_client(conn: socket.socket) -> None:
+    global DEGRADED
     conn.settimeout(None)
     if os.environ.get("VFS491D_TEST_MODE") != "1" and not peer_is_root(conn):
         conn.sendall(b"ERR 13\n")
+        return
+    if DEGRADED:
+        conn.sendall(f"ERR {SESSION_RESET_STATUS}\n".encode())
+        log("rejected client because vendor session is degraded; run vfs491-recover")
+        return
+    healthy, health_detail = vendor_service_health()
+    if not healthy:
+        DEGRADED = True
+        log(f"vendor service health lost: {health_detail}; automatic reset disabled")
+        conn.sendall(f"ERR {SESSION_RESET_STATUS}\n".encode())
         return
     conn.sendall(b"READY\n")
     buffered = bytearray()
@@ -214,27 +314,40 @@ def serve_client(conn: socket.socket) -> None:
             status, frame, cancelled = capture_one(conn, buffered)
         except OSError as exc:
             log(f"capture bridge launch/read failed: {exc}")
-            try:
-                conn.sendall(b"ERR 12\n")
-            except OSError:
-                return
-            buffered.clear()
-            continue
-        buffered.clear()
-        if cancelled:
-            log("capture cancelled by closing fprintd client; vendor service remains resident")
+            poison_session(conn, f"capture bridge failure: {exc}", bytearray())
             return
+        buffered.clear()
+
+        if cancelled:
+            if not STOP:
+                DEGRADED = True
+                log("capture was cancelled while proprietary helper was active; vendor session marked degraded; automatic reset disabled")
+                try:
+                    conn.sendall(f"ERR {SESSION_RESET_STATUS}\n".encode())
+                except OSError:
+                    pass
+            return
+
         if status == 0 and validate_frame(bytes(frame)):
             conn.sendall(f"OK {len(frame)}\n".encode() + frame)
             log(f"delivered validated frame ({len(frame)} bytes)")
+            continue
+
+        if status == 11:
+            conn.sendall(b"ERR 11\n")
+            log("vendor capture returned a recoverable acquisition error; TOD retry budget applies")
+            continue
+
+        if status == 0:
+            reason = "bridge returned a malformed frame"
+        elif status == 10:
+            reason = "helper no-swipe timeout exited without vendor API cleanup"
+        elif status == 12:
+            reason = "capture helper terminated abnormally or was interrupted"
         else:
-            if status == 0:
-                log("bridge returned a malformed frame")
-                status = 12
-            if status not in (10, 11, 12):
-                status = 12
-            conn.sendall(f"ERR {status}\n".encode())
-            log(f"capture returned bridge status {status}; vendor service remains resident")
+            reason = f"bridge returned unexpected status {status}"
+        poison_session(conn, reason, bytearray())
+        return
 
 
 def prepare_socket(path: str) -> socket.socket:
@@ -285,7 +398,11 @@ def main() -> int:
     server = None
     try:
         server = prepare_socket(args.socket)
-        log(f"persistent capture broker ready at {args.socket}")
+        healthy, detail = vendor_service_health()
+        if not healthy:
+            log(f"vendor service is not healthy before broker readiness: {detail}")
+            return 75
+        log(f"persistent capture broker ready at {args.socket}; {detail}")
         while not STOP:
             try:
                 conn, _address = server.accept()

@@ -1,20 +1,23 @@
 [Unit]
-Description=Persistent HP Validity VFS491 fingerprint service
+Description=HP Validity VFS491 fingerprint service
 Documentation=file:/usr/share/doc/vfs491-fprintd-tod/README.md
 After=local-fs.target systemd-modules-load.service systemd-udev-trigger.service
 Before=fprintd.service
-StartLimitIntervalSec=60
-StartLimitBurst=4
+# A poisoned vendor session is deliberately not auto-restarted: the driver
+# close callback can precede completion of fprintd's D-Bus Release method.
+# Recovery is performed by vfs491-recover, which masks/stops fprintd first.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
 ExecStart=/usr/libexec/vfs491/vfs491d-launcher
 ExecStartPost=/usr/libexec/vfs491/vfs491-wait-ready
-Restart=on-failure
-RestartSec=5s
+Restart=no
 TimeoutStartSec=150s
-TimeoutStopSec=20s
+TimeoutStopSec=30s
 KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
 UMask=0077
 User=root
 Group=root
@@ -23,6 +26,7 @@ StateDirectoryMode=0700
 PrivateMounts=yes
 PrivateIPC=yes
 PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
 
-[Install]
-WantedBy=multi-user.target

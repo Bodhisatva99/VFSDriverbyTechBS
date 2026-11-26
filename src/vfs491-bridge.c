@@ -453,7 +453,8 @@ static int run_capture(const char *helper_path)
             goto out;
         }
         if (monotonic_ms() >= deadline) {
-            log_message("vfs491-bridge: outer capture timeout\n");
+            log_message("vfs491-bridge: outer capture deadline reached; proprietary session is tainted and must be reset after claim close\n");
+            result = VFS491_BROKER_ERR_NO_SWIPE_SESSION_RESET;
             goto out;
         }
 
@@ -571,12 +572,12 @@ static int run_capture(const char *helper_path)
             const char *signal_name = strsignal(sig);
             char message[256];
             snprintf(message, sizeof(message),
-                     "vfs491-bridge: worker terminated by signal %d (%s)%s\n",
+                     "vfs491-bridge: helper process terminated by signal %d (%s)%s; broker will reset the vendor service after claim close\n",
                      sig, signal_name ? signal_name : "unknown",
                      WCOREDUMP(child_status) ? " [core dumped]" : "");
             log_message(message);
             log_message("vfs491-bridge: HP service restart deferred until the libfprint device session is closed\n");
-            result = 12;
+            result = VFS491_BROKER_ERR_HELPER_FAILURE;
         } else {
             log_message("vfs491-bridge: worker ended with an unrecognized wait status\n");
         }
@@ -584,18 +585,21 @@ static int run_capture(const char *helper_path)
     }
 
     int helper_exit = WEXITSTATUS(child_status);
-    if (helper_exit == 117) {
-        log_message("vfs491-bridge: vendor acquisition returned VFSW_CAPTURE_ERROR; scheduling a bounded retry\n");
-        result = 11;
+    /* The preserved reference helper exits with status 1 for
+     * VFSW_CAPTURE_ERROR after logging this message and reaching its normal
+     * cleanup label. It does not use a dedicated exit status such as 117. */
+    if (strstr(log_buf, "Could not capture fingerprint") != NULL) {
+        log_message("vfs491-bridge: vendor acquisition returned VFSW_CAPTURE_ERROR after helper cleanup; bounded retry is safe\n");
+        result = VFS491_BROKER_ERR_ACQUISITION;
         goto out;
     }
     if (helper_exit == 110 && strstr(log_buf, "Timed out waiting for capture") != NULL) {
-        log_message("vfs491-bridge: no swipe before vendor capture timeout; keeping HP service and USB enumeration unchanged for bounded retry\n");
-        result = 10;
+        log_message("vfs491-bridge: no swipe before vendor timeout; helper exited without vendor API cleanup, so broker must reset service after claim close\n");
+        result = VFS491_BROKER_ERR_NO_SWIPE_SESSION_RESET;
         goto out;
     }
     if (helper_exit == 112 || helper_exit == 113 || helper_exit == 114 || helper_exit == 115) {
-        log_message("vfs491-bridge: HP service restart deferred; close the libfprint device before explicit backend recovery\n");
+        log_message("vfs491-bridge: proprietary helper reported an initialization/IPC failure; broker will reset the service after claim close\n");
     }
     if (helper_exit != 0) {
         char msg[128];
@@ -646,6 +650,15 @@ out:
 
 int main(int argc, char **argv)
 {
+    /* The broker owns this bridge process. If the broker crashes, terminate
+     * the isolated helper too; otherwise an orphaned capture could continue
+     * using the vendor IPC session after the client has disappeared. */
+    pid_t broker_pid = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != broker_pid) {
+        perror("vfs491-bridge: establish broker parent-death signal");
+        return 125;
+    }
+
     if (argc != 2 || !argv[1] || !*argv[1]) {
         fprintf(stderr, "Usage: %s /path/to/vfs_proprietary-capture-helper\n", argv[0]);
         return 2;

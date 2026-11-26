@@ -1,59 +1,62 @@
-# VFS491 1.0.0 — Transaction 9 architecture
+# VFS491 1.0.0 — V2.0.0 architecture
 
-## Supported target
+## Target
 
-- HP EliteBook 8470p with Validity VFS491 USB sensor `138a:003d`
-- Linux Mint 22.x / Ubuntu 24.04 base
-- Existing `libfprint 1.94.7+tod1` runtime; build rejects a different core/TOD ABI
-- x86_64
+- HP EliteBook 8470p, Validity VFS491 USB `138a:003d`
+- Linux Mint 22.x / Ubuntu 24.04 base, x86_64
+- Installed `libfprint 1.94.7+tod1` core and TOD runtime must match exactly
+- No other VFS model is enabled or hardware-certified
 
-No other VFS model is enabled by this release. Firmware inclusion alone does not establish compatibility.
+## Process ownership
 
-## Service lifecycle
+1. `vfs491d.service` starts `vfs491d-launcher` inside private mount, IPC and temporary-file namespaces.
+2. The launcher verifies USB stability and obtains the host-visible exclusive VFS491 lock.
+3. The launcher starts `vcsFPService`, records its PID, verifies the vendor readiness marker, and waits for USB stability again.
+4. The launcher starts the Unix-socket broker as a supervised child and monitors both broker liveness and the exact vendor-service PID.
+5. If the vendor process exits or changes PID, the launcher terminates the broker and fails the systemd unit. If the broker exits unexpectedly, the launcher also fails the unit.
+6. Systemd restarts failed units with a bounded start rate (30 starts per 300 seconds). This accommodates repeated user-triggered 30-second no-swipe recoveries without immediately exhausting the default five-start burst, while still bounding startup crash loops. Vendor stdout/stderr and broker/helper diagnostics go to the journal.
+7. `ExecStartPost` opens the actual broker socket, checks `READY`, and sends `QUIT` before systemd considers startup complete.
 
-1. `vfs491d.service` is boot-enabled and uses `Type=exec`.
-2. Systemd runs the launcher, then runs `vfs491-wait-ready` as `ExecStartPost`. The readiness program opens the actual Unix socket, checks the broker's `READY` greeting, sends `QUIT` to close its temporary client, and exits. Systemd completes the start job only after this succeeds.
-3. This avoids a `NOTIFY_SOCKET` dependency. The launcher intentionally mounts a private tmpfs over `/run`, which hid the pathname notification socket from Transaction 7's Python broker. That failure caused systemd to terminate a broker that had already created its socket.
-4. The launcher validates private mount and IPC namespaces before mounting, holds a host-visible exclusive lock, waits for stable USB `138a:003d`, stages the vendor-required `pidof` path, sets up private `/run` and `/usr/sbin`, and starts `vcsFPService` once.
-5. The launcher starts the broker in the foreground. The broker binds `/var/lib/vfs491/control.sock`, a root-only socket outside the private `/run` and `/tmp` overlays.
-6. The systemd service remains active for the machine lifetime. A short-lived client proxy exists per fprintd claim; closing a proxy does not stop the persistent broker or HP vendor service.
-7. Each `CAPTURE` runs a fresh invocation of the preserved 0.3.2 helper through `vfs491-bridge`. The bridge uses the CH_EVENT full-read compatibility shim and returns a framed image.
-8. The broker validates the VFS1 frame's magic, version, width, height, maximum size and exact payload length before forwarding it.
-9. Service stop, package removal or system shutdown ends the resident service. Cleanup is scoped to the service's private mount/IPC namespaces.
+## Capture protocol
 
-## Startup and readiness contract
+- A per-claim client proxy connects to `/var/lib/vfs491/control.sock`.
+- `CAPTURE` starts a fresh bridge and preserved reference helper process.
+- The helper receives three inherited pipe descriptors for ready, metadata and image data.
+- The bridge validates metadata and the exact payload length, then emits a versioned `VFS1` frame.
+- The broker validates the frame again before forwarding it to the TOD backend.
+- The TOD backend retains the archived Validity image flags `FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_V_FLIPPED`.
+- Successful captures leave the persistent service running and can be followed by another capture in the same device claim.
 
-- `Type=exec` avoids `Type=notify`'s dependency on the systemd notification socket.
-- `ExecStartPost` is the readiness barrier. It cannot return success until the broker accepts a Unix-socket client and emits `READY`.
-- `TimeoutStartSec=150s` covers USB stability checks, vendor startup and socket readiness. The readiness probe itself is bounded.
-- `systemctl start vfs491d.service` and the TOD client's idempotent start request therefore wait until the broker is actually accepting clients.
-- The daemon does not attempt systemd notification calls.
-- Debian `postinst` does not suppress service-start failures. A failed start is a failed package configuration, not a false successful install.
+## Poisoned-session recovery
 
-## Capture and claim behavior
+The original helper has a hard 30-second alarm while waiting inside `vfs_capture()`. Its signal handler calls `exit(ETIMEDOUT)` directly; that bypasses `vfs_free_img_data()`, `vfs_clean_handles()` and `vfs_dev_exit()`. The original source also warns that killing an application while it is waiting in `vfs_capture()` can lock the vendor IPC path.
 
-- Root-only `SO_PEERCRED` validation gates the local socket.
-- Client `QUIT` or disconnect closes only the client connection. If a capture is active, its bridge/helper process group is terminated; the vendor service remains resident.
-- The proprietary HP service lifecycle is independent of fprintd's device claim lifecycle.
-- No-swipe timeout remains terminal for the active TOD claim. The driver does not restart the vendor service behind an open FpDevice.
-- A service restart can reset/re-enumerate USB and is not part of ordinary authentication.
+Therefore, V2.0.0 does not interpret this timeout as an idle retry. It treats the vendor session as tainted:
+
+1. Bridge status 10 (vendor no-swipe timeout), status 12 (abnormal helper termination) or active-capture cancellation causes the broker to mark the service for reset.
+2. The broker sends `ERR 14` to the TOD backend. The backend reports a session error instead of requesting another capture from the same vendor session.
+3. The broker waits for the fprintd/TOD client to send `QUIT` or disconnect, up to a bounded drain timeout. This allows the active `FpDevice` claim to close before service teardown.
+4. The broker exits with status 75. The launcher then stops the exact vendor process and exits with the same non-zero status.
+5. Systemd restarts the service, waits for vendor and broker readiness, and reopens the socket.
+
+Status 11 is reserved for `VFSW_CAPTURE_ERROR`, where the preserved helper logs `Could not capture fingerprint`, exits with status 1 and reaches its normal cleanup path. The bridge recognizes that exact helper diagnostic instead of assuming an undocumented exit code. The TOD backend applies a small bounded retry budget to this condition only.
+
+The drain timeout is a final liveness bound, not proof that fprintd always closes the claim within that time. Hardware logs must confirm the expected `QUIT`/disconnect sequence. If the timeout expires, service restart still proceeds to prevent a permanently wedged machine, and the journal records the forced recovery.
+
+## Enrollment and matcher baseline
+
+- Enrollment count is one stage, matching `VFS_PROPRIETARY_NR_ENROLL 1` in the archived Validity source.
+- Matcher threshold remains explicitly 40, the bundled libfprint 1.94.7 default.
+- No image rotation, mirroring, resizing, crop, intensity normalization or automatic quality rejection is added.
+- Image telemetry is observational only.
 
 ## Package boundary
 
-- The package contains the native TOD module, service, broker, client, bridge, vendor payload and CH_EVENT shim.
-- It pins the exact installed matching `libfprint-2-2` / `libfprint-2-tod1` versions.
-- It does not change PAM, LightDM, fprintd enrollment data or libfprint core.
+- Installs the TOD module, broker, client, bridge, helper launcher, vendor stack, firmware, systemd unit, fprintd ordering drop-in and diagnostics.
+- Pins the exact installed libfprint core/TOD versions.
+- Does not edit PAM, LightDM, Fingwit, Cinnamon or GNOME Keyring configuration.
+- On purge, removes `/var/lib/vfs491` and the VFS491 runtime lock. User fingerprint enrollment data under `/var/lib/fprint` is not removed by the package.
 
-## Hardware acceptance required
+## Hardware acceptance
 
-1. Service starts at boot, `systemctl is-active` reports active, and the broker socket is mode 0600.
-2. `vcsFPService` PID stays constant across two captures in each of two independent fprintd claims.
-3. Kernel log shows no USB disconnect/re-enumeration between captures or claims.
-4. Enrollment accepts multiple swipes and finishes; same-finger verify matches and different-finger verify rejects.
-5. Repeated sudo authentication, close/reopen, no-swipe timeout, cancellation, daemon restart, suspend/resume, unplug/replug and reboot are tested.
-6. PAM/LightDM integration is enabled only in a separate later package/change after the CLI lifecycle is stable.
-
-
-## Transaction 9 recognition contract
-
-The TOD image handoff keeps the archived VFS proprietary driver's one-stage enrollment and `COLORS_INVERTED | V_FLIPPED` image flags. The image-device matcher threshold is explicitly 40, the libfprint 1.94.7 default. No threshold weakening or unmeasured pixel transformations are used. See `RECOGNITION-PIPELINE.md` for diagnostic procedures and evidence boundaries.
+A successful build is not hardware acceptance. Validate cold boot, repeated frame captures, same-finger matching, different-finger rejection, enrollment, close/reopen, no-swipe timeout, cancellation, vendor crash recovery, broker crash recovery, fprintd restart, suspend/resume, unplug/replug, LightDM, lock screen and `sudo`. Record PID changes, USB bus/device number, frame metrics and service restart timestamps.

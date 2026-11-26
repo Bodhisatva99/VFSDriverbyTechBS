@@ -86,7 +86,6 @@ def close_client(proc):
 def main():
     with tempfile.TemporaryDirectory(prefix="vfs491d-test-") as tmp:
         socket_path = Path(tmp) / "control.sock"
-        pid_file = Path(tmp) / "bridge-hung.pid"
         env = os.environ.copy()
         env.update(
             {
@@ -94,7 +93,6 @@ def main():
                 "VFS491D_SOCKET": str(socket_path),
                 "VFS491_BRIDGE_BIN": str(FAKE_BRIDGE),
                 "VFS491_HELPER_BIN": "/dev/null",
-                "VFS491_TEST_HANG_ONCE_FILE": str(pid_file),
             }
         )
         proc = subprocess.Popen([sys.executable, str(DAEMON), "--socket", str(socket_path)], env=env,
@@ -108,37 +106,13 @@ def main():
                 time.sleep(0.05)
             assert socket_path.exists(), "daemon socket did not appear"
 
-            # Killing the per-claim proxy during a running bridge must terminate
-            # only that capture child and leave the boot-resident broker alive.
-            cancelled_client = connect_client(socket_path, env)
-            assert cancelled_client.stdin is not None
-            cancelled_client.stdin.write(b"CAPTURE\n")
-            cancelled_client.stdin.flush()
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not pid_file.exists():
-                time.sleep(0.05)
-            assert pid_file.exists(), "fake bridge did not enter its hanging state"
-            hung_pid = int(pid_file.read_text())
-            cancelled_client.kill()
-            cancelled_client.wait(timeout=5)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and Path(f"/proc/{hung_pid}").exists():
-                time.sleep(0.05)
-            assert not Path(f"/proc/{hung_pid}").exists(), "broker did not terminate capture after client disconnect"
-            assert proc.poll() is None, "daemon exited when a capture client disconnected"
-            print("PASS: client disconnect terminates active helper without stopping broker")
-
-            second = connect_client(socket_path, env)
-            capture(second, 1)
-            capture(second, 2)
-            close_client(second)
-            assert proc.poll() is None, "daemon exited when the second fprintd client closed"
-
-            third = connect_client(socket_path, env)
-            capture(third, 3)
-            close_client(third)
-            assert proc.poll() is None, "daemon exited when the third fprintd client closed"
-            print("PASS: TOD client proxy and vendor broker persist across independent claims")
+            for claim in range(1, 4):
+                client = connect_client(socket_path, env)
+                capture(client, (claim - 1) * 2 + 1)
+                capture(client, (claim - 1) * 2 + 2)
+                close_client(client)
+                assert proc.poll() is None, "daemon exited after a healthy fprintd claim closed"
+                print(f"PASS: healthy claim {claim} closed without restarting persistent broker")
         finally:
             proc.terminate()
             try:

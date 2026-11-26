@@ -16,6 +16,7 @@
 #include "fpi-image.h"
 
 #include "vfs491-protocol.h"
+#include "vfs491-image-metrics.h"
 
 #ifndef VFS491_DEFAULT_CLIENT
 #define VFS491_DEFAULT_CLIENT "/usr/libexec/vfs491/vfs491-client"
@@ -37,6 +38,7 @@
 #endif
 
 #define VFS491_MAX_CAPTURE_ERROR_RETRIES 2
+#define VFS491_ENROLL_STAGES 1
 #define VFS491_CANCEL_GRACE_SECONDS 8
 #define VFS491_MAX_FRAME_SIZE (sizeof (struct vfs491_frame_header) + VFS491_MAX_IMAGE_BYTES)
 
@@ -63,6 +65,8 @@ struct _FpDeviceVfs491 {
     gboolean close_pending;
     guint io_pending;
     guint capture_error_count;
+    gchar *claim_id;
+    guint capture_sequence;
     gint64 session_started_us;
     gint64 capture_started_us;
     guint8 *pending_frame;
@@ -140,8 +144,8 @@ vfs491_finish_deactivation (FpDeviceVfs491 *self)
         self->force_exit_source = 0;
     }
 
-    /* Image-device deactivate runs between swipe captures during enrollment.
-     * Closing this fprintd state transition must not affect the resident daemon. */
+    /* Image-device deactivation ends a capture cycle, not the fprintd device
+     * claim. Keep the per-claim broker proxy open until img_close(). */
     self->active = FALSE;
     self->deactivating = FALSE;
     fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (self), NULL);
@@ -165,6 +169,8 @@ vfs491_finish_close (FpDeviceVfs491 *self)
     self->session_process_exited = FALSE;
     self->close_pending = FALSE;
     self->capture_error_count = 0;
+    g_clear_pointer (&self->claim_id, g_free);
+    self->capture_sequence = 0;
     fpi_image_device_close_complete (FP_IMAGE_DEVICE (self), NULL);
 }
 
@@ -225,41 +231,47 @@ vfs491_parse_image_frame (GBytes *bytes,
 }
 
 static void
-vfs491_log_frame_statistics (const guint8 *pixels,
+vfs491_log_frame_statistics (FpDeviceVfs491 *self,
+                             const guint8 *pixels,
                              gsize image_len,
                              guint width,
-                             guint height)
+                             guint height,
+                             gdouble capture_ms)
 {
-    guint8 minimum = 255;
-    guint8 maximum = 0;
-    guint64 sum = 0;
-    long double sum_squares = 0;
-    long double mean;
-    long double variance;
+    struct vfs491_image_metrics metrics;
 
-    for (gsize i = 0; i < image_len; i++) {
-        guint8 value = pixels[i];
-        minimum = MIN (minimum, value);
-        maximum = MAX (maximum, value);
-        sum += value;
-        sum_squares += (long double) value * value;
+    if (vfs491_image_metrics_compute (pixels, image_len, width, height,
+                                      &metrics) != 0) {
+        g_warning ("VFS491: could not calculate image quality telemetry");
+        return;
     }
 
-    mean = (long double) sum / image_len;
-    variance = (sum_squares / image_len) - (mean * mean);
-    if (variance < 0)
-        variance = 0;
-
-    /* These statistics help diagnose false rejects without logging or
-     * exporting biometric image data. The frame itself stays in memory. */
-    g_message ("VFS491: image quality telemetry %ux%u bytes=%" G_GSIZE_FORMAT
-             " min=%u max=%u mean=%.2Lf stddev=%.2Lf",
-             width, height, image_len, (guint) minimum, (guint) maximum,
-             mean, sqrtl (variance));
+    /* Derived statistics only: never journal pixels, templates or minutiae.
+     * The claim/capture key lets the verification-study tool associate these
+     * measurements with one fprintd-verify result without storing biometrics. */
+    g_message ("VFS491_EVENT type=frame claim_id=%s capture=%u"
+               " width=%u height=%u bytes=%" G_GSIZE_FORMAT
+               " capture_ms=%.1f min=%u p05=%u p50=%u p95=%u max=%u"
+               " mean=%.2f stddev=%.2f entropy=%.3f"
+               " dark_pct=%.2f bright_pct=%.2f row_sd=%.2f col_sd=%.2f"
+               " grad_h=%.2f grad_v=%.2f",
+               self->claim_id ? self->claim_id : "unassigned",
+               self->capture_sequence, width, height, image_len, capture_ms,
+               (guint)metrics.minimum,
+               (guint)metrics.percentile_05,
+               (guint)metrics.percentile_50,
+               (guint)metrics.percentile_95,
+               (guint)metrics.maximum,
+               metrics.mean, metrics.stddev, metrics.entropy_bits,
+               metrics.dark_pct, metrics.bright_pct,
+               metrics.row_mean_stddev, metrics.column_mean_stddev,
+               metrics.horizontal_gradient_mean,
+               metrics.vertical_gradient_mean);
 }
 
 static void
-vfs491_deliver_frame (FpDeviceVfs491 *self, GBytes *bytes)
+vfs491_deliver_frame (FpDeviceVfs491 *self, GBytes *bytes,
+                      gdouble capture_ms)
 {
     g_autoptr(GError) error = NULL;
     guint width = 0, height = 0;
@@ -273,7 +285,8 @@ vfs491_deliver_frame (FpDeviceVfs491 *self, GBytes *bytes)
         return;
     }
 
-    vfs491_log_frame_statistics (pixels, image_len, width, height);
+    vfs491_log_frame_statistics (self, pixels, image_len, width, height,
+                                 capture_ms);
 
     image = fp_image_new ((gint) width, (gint) height);
     if (!image) {
@@ -355,13 +368,13 @@ vfs491_frame_read_done (GObject *source_object,
     GBytes *bytes = g_bytes_new_take (self->pending_frame, bytes_read);
     self->pending_frame = NULL;
     self->pending_frame_length = 0;
+    const gdouble capture_ms = self->capture_started_us > 0
+        ? (g_get_monotonic_time () - self->capture_started_us) / 1000.0
+        : 0.0;
     g_message ("VFS491: received a complete frame (%" G_GSIZE_FORMAT
-               " bytes) in %.1f ms", bytes_read,
-               self->capture_started_us > 0
-                   ? (g_get_monotonic_time () - self->capture_started_us) / 1000.0
-                   : 0.0);
+               " bytes) in %.1f ms", bytes_read, capture_ms);
     self->capture_started_us = 0;
-    vfs491_deliver_frame (self, bytes);
+    vfs491_deliver_frame (self, bytes, capture_ms);
     g_bytes_unref (bytes);
     vfs491_maybe_finish_deactivation (self);
     g_object_unref (self);
@@ -404,23 +417,27 @@ vfs491_response_line_done (GObject *source_object,
         gboolean valid = end != line + 4 && *end == '\0';
         g_free (line);
         self->capture_pending = FALSE;
-        g_message ("VFS491: capture response received in %.1f ms",
-                   self->capture_started_us > 0
-                       ? (g_get_monotonic_time () - self->capture_started_us) / 1000.0
-                       : 0.0);
+        const gdouble capture_ms = self->capture_started_us > 0
+            ? (g_get_monotonic_time () - self->capture_started_us) / 1000.0
+            : 0.0;
+        g_message ("VFS491: capture response received in %.1f ms", capture_ms);
+        if (valid)
+            g_message ("VFS491_EVENT type=capture_error claim_id=%s capture=%u broker_status=%d capture_ms=%.1f",
+                       self->claim_id ? self->claim_id : "unassigned",
+                       self->capture_sequence, status, capture_ms);
         self->capture_started_us = 0;
         if (!valid) {
             vfs491_report_error (self,
                 g_error_new_literal (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                                      "VFS491 broker returned a malformed error response"));
-        } else if (status == 10) {
-            vfs491_report_error (self,
-                g_error_new_literal (G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
-                                     "No VFS491 swipe before the vendor capture deadline; close the device before backend recovery"));
-        } else if (status == 11) {
+        } else if (status == VFS491_BROKER_ERR_ACQUISITION) {
             vfs491_retry_scan_or_fail (self, "vendor capture returned an acquisition error");
-        } else if (status == 12) {
-            vfs491_retry_scan_or_fail (self, "legacy capture helper terminated abnormally");
+        } else if (status == VFS491_BROKER_ERR_NO_SWIPE_SESSION_RESET ||
+                   status == VFS491_BROKER_ERR_HELPER_FAILURE ||
+                   status == VFS491_BROKER_ERR_SESSION_RESET) {
+            vfs491_report_error (self,
+                g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
+                             "VFS491 capture session is no longer safe to reuse (broker status %d); close the device claim so the vendor service can be restarted", status));
         } else {
             vfs491_report_error (self,
                 g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -521,7 +538,11 @@ vfs491_start_capture (FpDeviceVfs491 *self)
         return;
 
     self->capture_pending = TRUE;
+    self->capture_sequence++;
     self->capture_started_us = g_get_monotonic_time ();
+    g_message ("VFS491_EVENT type=capture_start claim_id=%s capture=%u",
+               self->claim_id ? self->claim_id : "unassigned",
+               self->capture_sequence);
     g_message ("VFS491: requesting swipe capture in the current session");
     self->io_pending++;
     g_output_stream_write_all_async (self->session_stdin,
@@ -569,7 +590,7 @@ vfs491_session_ready_line_done (GObject *source_object,
                    ? (g_get_monotonic_time () - self->session_started_us) / 1000.0
                    : 0.0);
     self->session_started_us = 0;
-    g_message ("VFS491: boot-resident vendor service is ready for repeated scans");
+    g_message ("VFS491: systemd-managed vendor service is ready for this device session");
 
     if (self->opening && !self->open_completed) {
         self->opening = FALSE;
@@ -742,6 +763,9 @@ vfs491_img_open (FpImageDevice *device)
         return;
     }
 
+    g_clear_pointer (&self->claim_id, g_free);
+    self->claim_id = g_uuid_string_random ();
+    self->capture_sequence = 0;
     self->opening = TRUE;
     self->open_completed = FALSE;
     self->active = FALSE;
@@ -750,7 +774,7 @@ vfs491_img_open (FpImageDevice *device)
     self->session_process_exited = FALSE;
     self->capture_error_count = 0;
 
-    /* Connect to the boot-resident broker during device claim. The proxy is
+    /* Connect to the systemd-managed broker during device claim. The proxy is
      * per-claim; the vendor service and USB ownership outlive every claim. */
     vfs491_start_session (self);
 }
@@ -847,7 +871,7 @@ vfs491_deactivate (FpImageDevice *device)
     FpDeviceVfs491 *self = (FpDeviceVfs491 *) device;
 
     /* A completed swipe only deactivates the image FSM. The broker connection
-     * and the boot-resident vendor service remain available for later swipes. */
+     * and the systemd-managed vendor service remain available for later swipes. */
     if (!self->capture_pending && !self->session_starting) {
         self->active = FALSE;
         self->deactivating = FALSE;
@@ -894,6 +918,15 @@ static const FpIdEntry vfs491_id_table[] = {
 };
 
 static void
+fp_device_vfs491_finalize (GObject *object)
+{
+    FpDeviceVfs491 *self = (FpDeviceVfs491 *) object;
+
+    g_clear_pointer (&self->claim_id, g_free);
+    G_OBJECT_CLASS (fp_device_vfs491_parent_class)->finalize (object);
+}
+
+static void
 fp_device_vfs491_init (FpDeviceVfs491 *self)
 {
     (void) self;
@@ -902,18 +935,20 @@ fp_device_vfs491_init (FpDeviceVfs491 *self)
 static void
 fp_device_vfs491_class_init (FpDeviceVfs491Class *klass)
 {
+    GObjectClass *object_class = G_OBJECT_CLASS (klass);
     FpDeviceClass *device_class = FP_DEVICE_CLASS (klass);
     FpImageDeviceClass *image_class = FP_IMAGE_DEVICE_CLASS (klass);
 
+    object_class->finalize = fp_device_vfs491_finalize;
     device_class->id = "vfs491";
     device_class->full_name = "Validity VFS491 (persistent service / session client)";
     device_class->type = FP_DEVICE_TYPE_USB;
     device_class->id_table = vfs491_id_table;
     device_class->scan_type = FP_SCAN_TYPE_SWIPE;
-    /* The archived VFS proprietary driver also uses one swipe stage. Keep
-     * the sensor's enrollment contract stable; do not guess a multi-stage
-     * count as a substitute for diagnosing image/matcher quality. */
-    device_class->nr_enroll_stages = 1;
+    /* Match the archived Validity VFS proprietary driver's one-stage
+     * enrollment declaration. Multi-stage enrollment remains an unvalidated
+     * experiment and is not enabled in the reliability baseline. */
+    device_class->nr_enroll_stages = VFS491_ENROLL_STAGES;
 
     /* libfprint 1.94.7 default is 40. Set it explicitly for a reproducible
      * matcher configuration; do not lower it without false-accept testing. */
